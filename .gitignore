@@ -1,0 +1,26 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env/
+.conda/
+conda-env/
+
+# Environment variable files
+.env
+.env.*
+
+# HDF5 data files
+*.h5
+*.hdf5
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
