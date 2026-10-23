@@ -1,415 +1,108 @@
-"""
-Tennessee Eastman Process - closed-loop simulation (simple Python version)
+# Generate TEP_Train_Full.h5 (0-300 h) and TEP_Test_Full.h5 (300-350 h) from one continuous run
 
-Plant model:   teprob.f      (Downs & Vogel, Comput. Chem. Eng. 17:245-255, 1993)
-Control:       temain_mod.f  (Russell, Chiang & Braatz, 2000)
+import json
+import time
+from pathlib import Path
 
-Differences from the Fortran (dynamics are the same):
-- Integration with scipy solve_ivp between 3 s control instants
-  (Fortran: explicit Euler, 1 s step).
-- Disturbances, measurement noise and analyser sampling are updated once per
-  3 s interval, outside the derivative function.
-- numpy random numbers instead of the Fortran generator.
-"""
- 
+import h5py
 import numpy as np
-from scipy.integrate import solve_ivp
 
+ROOT = Path(__file__).parent
+_nb = json.loads((ROOT / "TEP_Simulation.ipynb").read_text())
+for _i in (0, 1, 2, 4):
+    exec("".join(_nb["cells"][_i]["source"]))
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+# Config
 
-HOURS = 48.0            # Simulated time (h)
-SEED = 0                # RNG seed (None = random)
-RECORD_EVERY = 180      # Sampling interval (s), multiple of 3
-PRINT_EVERY = 3600      # Progress message interval (s), 0 = off
-NOISE = True            # Measurement noise on/off
+SEED = 0
+RECORD_EVERY = 180        # 3 min
+FLUSH_EVERY = 25 * 3600   # write to h5 every 25 simulated hours
+NOISE = True
+T_SPLIT = 300.0           # train 0-300 h, test 300-350 h
+HOURS = 350.0
 
-# Faults: (IDV, t_on (h), t_off (h)); active for t_on <= t < t_off, t_off = None -> until end
-FAULT_SCHEDULE = [
-    (12, 8.0, None),
+RAW_PATH = ROOT / "TEP_Run_Full_raw.h5"
+TRAIN_PATH = ROOT / "TEP_Train_Full.h5"
+TEST_PATH = ROOT / "TEP_Test_Full.h5"
+
+# Faults used
+FAULTS_USED = [1, 2, 4, 5, 6, 7, 8, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20]
+FAULTS_EXCLUDED = [3, 9, 19]
+
+# Training: 10 h normal, then two rounds of all 17 faults in 8.5 h slots (4 h fault, 4.5 h normal)
+TRAIN_ROUNDS = [
+    [1, 8, 15, 4, 11, 18, 2, 12, 16, 5, 13, 20, 7, 10, 17, 6, 14],
+    [12, 5, 18, 2, 14, 16, 7, 11, 20, 1, 10, 15, 6, 8, 17, 4, 13],
 ]
+TRAIN_START, TRAIN_SLOT, TRAIN_ON = 10.0, 8.5, 4.0
+FAULT_ON_CAP = {6: 3.0}
 
-# IDV numbering (original Downs & Vogel number in brackets)
-#   Steps:     1  A/C feed ratio, B constant (1)        5  Condenser CW inlet temp (5)
-#              2  B composition, A/C constant (2)       6  A feed loss (6)
-#              3  D feed temperature (3)                7  C header pressure loss (7)
-#              4  Reactor CW inlet temp (4)
-#   Walks:     8  A, B, C feed composition (8)          12 Condenser CW inlet temp (12)
-#              9  D feed temperature (9)                13 Reaction kinetics (13)
-#              10 C feed temperature (10)               14 Stripper steam heat transfer (16)
-#              11 Reactor CW inlet temp (11)
-#   Pulses:    15 Reactor heat transfer (17)            17 Reactor-separator flow (20)
-#              16 Condenser heat transfer (18)
-#   Stiction:  18 Reactor CW valve (14)                 20 Recycle, sep. underflow, stripper
-#              19 Condenser CW valve (15)                  product and steam valves (19)
-
-# Initial set points SETPT(1..20). Cascaded set points (1, 2, 3, 4, 6, 9, 10, 16)
-# are adjusted by outer loops during the run; 12 is not used.
-SETPOINTS = {
-    1:  3664.0,     # D feed flow (kg/h)
-    2:  4509.3,     # E feed flow (kg/h)
-    3:  0.25052,    # A feed flow (kscmh)
-    4:  9.3477,     # A and C feed flow (kscmh)
-    5:  26.902,     # Recycle flow (kscmh)
-    6:  0.33712,    # Purge rate (kscmh)
-    7:  50.0,       # Separator level (%)
-    8:  50.0,       # Stripper level (%)
-    9:  230.31,     # Stripper steam flow (kg/h)
-    10: 94.599,     # Reactor CW outlet temperature (C)
-    11: 22.949,     # Stripper underflow (m3/h)
-    12: 2633.7,     # Separator pressure (kPa)
-    13: 32.188,     # Reactor feed A (mol%)
-    14: 6.8820,     # Reactor feed D (mol%)
-    15: 18.776,     # Reactor feed E (mol%)
-    16: 65.731,     # Stripper temperature (C)
-    17: 75.0,       # Reactor level (%)
-    18: 120.40,     # Reactor temperature (C)
-    19: 13.823,     # Purge B (mol%)
-    20: 0.83570,    # Product E (mol%)
-}
-
-CONFIG = {
-    "hours": HOURS,
-    "seed": SEED,
-    "record_every": RECORD_EVERY,
-    "print_every": PRINT_EVERY,
-    "noise": NOISE,
-    "fault_schedule": FAULT_SCHEDULE,
-    "setpoints": SETPOINTS,
-}
+# Testing: 2 h normal, then 12 faults in 4 h slots (2 h fault, 2 h normal)
+TEST_ORDER = [4, 12, 1, 16, 10, 14, 2, 20, 11, 5, 15, 8]
+TEST_START, TEST_SLOT, TEST_ON = T_SPLIT + 2.0, 4.0, 2.0
 
 
-# Physical constants (component order A..H)
-
-XMW = np.array([2.0, 25.4, 28.0, 32.0, 46.0, 48.0, 62.0, 76.0])                                         # Molecular weights (g/mol)
-AVP = np.array([0, 0, 0, 15.92, 16.35, 16.35, 16.43, 17.21])                                            # Antoine coefficients for vapor pressure
-BVP = np.array([0, 0, 0, -1444.0, -2114.0, -2114.0, -2748.0, -3318.0])                                  # Antoine coefficients for vapor pressure
-CVP = np.array([0, 0, 0, 259.0, 265.5, 265.5, 232.9, 249.6])                                            # Antoine coefficients for vapor pressure
-AD = np.array([1, 1, 1, 23.3, 33.9, 32.8, 49.9, 50.5])                                                  # Liquid density coefficients
-BD = np.array([0, 0, 0, -0.0700, -0.0957, -0.0995, -0.0191, -0.0541])                                   # Liquid density coefficients
-CD = np.array([0, 0, 0, -0.0002, -0.000152, -0.000233, -0.000425, -0.000150])                           # Liquid density coefficients
-AH = np.array([1e-6, 1e-6, 1e-6, 0.960e-6, 0.573e-6, 0.652e-6, 0.515e-6, 0.471e-6])                     # Heat capacity coefficients (liquid)
-BH = np.array([0, 0, 0, 8.70e-9, 2.41e-9, 2.18e-9, 5.65e-10, 8.70e-10])                                 # Heat capacity coefficients (liquid)
-CH = np.array([0, 0, 0, 4.81e-11, 1.82e-11, 1.94e-11, 3.82e-12, 2.62e-12])                              # Heat capacity coefficients (liquid)
-AV = np.array([1e-6, 1e-6, 1e-6, 86.7e-6, 160e-6, 160e-6, 225e-6, 209e-6])                              # Heat of vaporisation
-AG = np.array([3.411e-6, 0.3799e-6, 0.2491e-6, 0.3567e-6, 0.3463e-6, 0.3930e-6, 0.170e-6, 0.150e-6])    # Heat capacity coefficients (gas)
-BG = np.array([7.18e-10, 1.08e-9, 1.36e-11, 8.51e-10, 8.96e-10, 1.02e-9, 0, 0])                         # Heat capacity coefficients (gas)
-CG = np.array([6.0e-13, -3.98e-13, -3.93e-14, -3.12e-13, -3.27e-13, -3.12e-13, 0, 0])                   # Heat capacity coefficients (gas)
-
-VRNG = np.array([400, 400, 100, 1500, 0, 0, 1500, 1000, 0.03, 1000, 1200, 0.0])  # Valve flow ranges
-VTAU = np.array([8, 8, 6, 9, 7, 5, 5, 5, 120, 5, 5, 5]) / 3600.0                 # Valve time constants (h)
-VTR, VTS, VTC, VTV = 1300.0, 3500.0, 156.5, 5000.0                               # Vessel volumes
-HTR = np.array([0.06899381054, 0.05])                                            # Heat of reaction (kcal/mol) for reactions 1 and 2
-HWR, HWS = 7060.0, 11138.0
-CPFLMX, CPPRMX = 280275.0, 1.3
-RG = 998.9
-
-# Fixed feed compositions (streams 1-3); stream 4 is disturbed
-X_FEED = {1: [0, 0.0001, 0, 0.9999, 0, 0, 0, 0],      # D feed
-          2: [0, 0, 0, 0, 0.9999, 0.0001, 0, 0],      # E feed
-          3: [0.9999, 0.0001, 0, 0, 0, 0, 0, 0]}      # A feed
-
-# Measurement noise standard deviations, XMEAS(1..41)
-XNS = np.array([0.0012, 18.0, 22.0, 0.05, 0.2, 0.21, 0.3, 0.5, 0.01, 0.0017, 0.01, 1.0, 0.3, 0.125, 
-                1.0, 0.3, 0.115, 0.01, 1.15, 0.2, 0.01, 0.01, 0.25, 0.1, 0.25, 0.1, 0.25, 0.025, 
-                0.25, 0.1, 0.25, 0.1, 0.25, 0.025, 0.05, 0.05, 0.01, 0.01, 0.01, 0.5, 0.5])
-
-# Random-walk disturbance parameters (12 processes, TEINIT)
-HSPAN = np.array([0.2, 0.7, 0.25, 0.7, 0.15, 0.15, 1.0, 1.0, 0.4, 1.5, 2.0, 1.5])
-HZERO = np.array([0.5, 1.0, 0.5, 1.0, 0.25, 0.25, 2.0, 2.0, 0.5, 2.0, 3.0, 2.0])
-SSPAN = np.array([0.03, 0.003, 10, 10, 10, 10, 0.25, 0.25, 0.25, 0, 0, 0])
-SZERO = np.array([0.485, 0.005, 45, 45, 35, 40, 1.0, 1.0, 0, 0, 0, 0])
-
-# Initial (base-case) states YY(1..50)
-Y0 = np.array([
-    10.40491389, 4.363996017, 7.570059737, 0.4230042431, 24.15513437, 2.942597645,
-    154.3770655, 159.1865960, 2.808522723, 63.75581199, 26.74026066, 46.38532432,
-    0.2464521543, 15.20484404, 1.852266172, 52.44639459, 41.20394008, 0.5699317760,
-    0.4306056376, 7.9906200783e-03, 0.9056036089, 1.6054258216e-02, 0.7509759687,
-    8.8582855955e-02, 48.27726193, 39.38459028, 0.3755297257, 107.7562698, 29.77250546,
-    88.32481135, 23.03929507, 62.85848794, 5.546318688, 11.92244772, 5.555448243,
-    0.9218489762, 94.59927549, 77.29698353, 63.05263039, 53.97970677, 24.64355755,
-    61.30192144, 22.21000000, 40.06374673, 38.10034370, 46.53415582, 47.44573456,
-    41.10581288, 18.11349055, 50.00000000])
+def build_schedule():
+    schedule, t = [], TRAIN_START
+    for f in [f for r in TRAIN_ROUNDS for f in r]:
+        schedule.append((f, t, t + min(TRAIN_ON, FAULT_ON_CAP.get(f, TRAIN_ON))))
+        t += TRAIN_SLOT
+    assert t <= T_SPLIT
+    t = TEST_START
+    for f in TEST_ORDER:
+        schedule.append((f, t, t + TEST_ON))
+        t += TEST_SLOT
+    assert t <= HOURS
+    for r in TRAIN_ROUNDS:
+        assert sorted(r) == FAULTS_USED
+    assert set(TEST_ORDER) <= set(FAULTS_USED)
+    return schedule
 
 
-# Thermodynamic helpers (TESUB1-4)
-
-def enthalpy(x, t, ity):
-    # x = molar composition, t = temperature, ity = phase (0=liq, 1=gas, 2=gas with pressure correction)
-    if ity == 0:
-        hi = 1.8 * t * (AH + BH * t / 2 + CH * t**2 / 3)
-    else:
-        hi = 1.8 * t * (AG + BG * t / 2 + CG * t**2 / 3) + AV
-    h = np.sum(x * XMW * hi)
-    if ity == 2:
-        h -= 3.57696e-6 * (t + 273.15)
-    return h
+NAMES = {"xmeas": XMEAS_NAMES, "xmv": XMV_NAMES, "sp": SP_NAMES, "dist": DIST_NAMES,
+         "idv": [f"IDV {i}" for i in range(1, 21)], "idv_effective": [f"IDV {i}" for i in range(1, 21)],
+         "y": STATE_NAMES}
 
 
-def d_enthalpy(x, t, ity):
-    # x = molar composition, t = temperature, ity = phase (0=liq, 1=gas, 2=gas with pressure correction)
-    if ity == 0:
-        dhi = 1.8 * (AH + BH * t + CH * t**2)
-    else:
-        dhi = 1.8 * (AG + BG * t + CG * t**2)
-    dh = np.sum(x * XMW * dhi)
-    if ity == 2:
-        dh -= 3.57696e-6
-    return dh
+class ChunkWriter:
 
-# Newton iteration for temperature from specific enthalpy
-def temperature(x, h, ity, t_guess):
-    # x = molar composition, h = specific enthalpy, ity = phase (0=liq, 1=gas, 2=gas with pressure correction)
-    t = t_guess
-    for _ in range(100):
-        dt = -(enthalpy(x, t, ity) - h) / d_enthalpy(x, t, ity)
-        t += dt
-        if abs(dt) < 1e-12:
-            return t
-    return t_guess
+    def __init__(self, path):
+        self.f = h5py.File(path, "w")
+        self.buf = {k: [] for k in ["t", *NAMES]}
 
+    def append(self, **row):
+        for k, v in row.items():
+            self.buf[k].append(v)
 
-def density(x, t):
-    # x = molar composition, t = temperature
-    return 1.0 / np.sum(x * XMW / (AD + BD * t + CD * t**2))
-
-
-# Plant
-
-class TEPlant:
-    def __init__(self, seed=None):
-        self.rng = np.random.default_rng(seed)
-        self.idv = np.zeros(20, dtype=int)        # IDV(1..20) -> idv[0..19]
-        self.vcv = Y0[38:50].copy()               # valve commands after stiction
-        self.t_guess = np.array([120.0, 80.0, 65.0, 100.0])  # reactor, sep, stripper, vapour
-        # random-walk cubic splines: value = a + h*(b + h*(c + h*d))
-        self.a, self.b = SZERO.copy(), np.zeros(12)
-        self.c, self.d = np.zeros(12), np.zeros(12)
-        self.tlast, self.tnext = np.zeros(12), np.full(12, 0.1)
-
-    # Disturbances
-
-    # Current disturbance values
-    def walk(self, t):
-        h = t - self.tlast
-        return self.a + h * (self.b + h * (self.c + h * self.d))
-    
-    # Update random-walk splines
-    def update_walks(self, t):
-        idv = self.idv
-        flag = np.array([idv[7], idv[7], idv[8], idv[9], idv[10], idv[11],
-                         idv[12], idv[12], idv[13], idv[14], idv[15], idv[16]])
-        for i in range(12):
-            if t < self.tnext[i]:
-                continue
-            h = self.tnext[i] - self.tlast[i]
-            s = self.a[i] + h * (self.b[i] + h * (self.c[i] + h * self.d[i]))
-            sp = self.b[i] + h * (2 * self.c[i] + 3 * h * self.d[i])
-            self.tlast[i] = self.tnext[i]
-            if i < 9:   # smooth random walk
-                hn = HSPAN[i] * self.rng.uniform(-1, 1) + HZERO[i]
-                s1 = SSPAN[i] * self.rng.uniform(-1, 1) * flag[i] + SZERO[i]
-                s1p = 0.0
-                self.a[i], self.b[i] = s, sp
-                self.c[i] = (3 * (s1 - s) - hn * (s1p + 2 * sp)) / hn**2
-                self.d[i] = (2 * (s - s1) + hn * (s1p + sp)) / hn**3
-                self.tnext[i] = self.tlast[i] + hn
-            elif s > 0.1:   # pulse-type disturbances (IDV 15, 16, 17): decay back
-                self.a[i], self.b[i] = s, sp
-                self.c[i] = -(3 * s + 0.2 * sp) / 0.01
-                self.d[i] = (2 * s + 0.1 * sp) / 0.001
-                self.tnext[i] = self.tlast[i] + 0.1
+    def flush(self):
+        if not self.buf["t"]:
+            return
+        for k, rows in self.buf.items():
+            data = np.asarray(rows)
+            if k not in self.f:
+                self.f.create_dataset(k, data=data, maxshape=(None, *data.shape[1:]),
+                                      chunks=True, compression="gzip")
             else:
-                hn = HSPAN[i] * self.rng.uniform(-1, 1) + HZERO[i]
-                self.a[i] = self.b[i] = self.d[i] = 0.0
-                self.c[i] = flag[i] / hn**2
-                self.tnext[i] = self.tlast[i] + hn
+                ds = self.f[k]
+                n = ds.shape[0]
+                ds.resize(n + len(data), axis=0)
+                ds[n:] = data
+            rows.clear()
+        self.f.flush()
 
-    # Valve stiction (IDV 18, 19, 20): If active, valve only move if cmd change exceeds 2%
-    def update_valves(self, xmv):
-        stick = np.zeros(12)
-        stick[9], stick[10] = self.idv[17], self.idv[18]
-        stick[[4, 6, 7, 8]] = self.idv[19]
-        move = np.abs(self.vcv - xmv) > 2.0 * stick
-        self.vcv[move] = xmv[move]
-        self.vcv = np.clip(self.vcv, 0, 100)
-
-    # Dynamic Model
-    def model(self, t, y):
-        idv = self.idv
-        dist = self.walk(t)
-
-        # Disturbed feed (stream 4) and temperatures
-        x4 = np.zeros(8)
-        x4[0] = dist[0] - idv[0] * 0.03 - idv[1] * 2.43719e-3
-        x4[1] = dist[1] + idv[1] * 0.005
-        x4[2] = 1 - x4[0] - x4[1]
-        t_feed = {1: dist[2] + idv[2] * 5.0, 2: 45.0, 3: 45.0, 4: dist[3]}
-        tcwr = dist[4] + idv[3] * 5.0
-        tcws = dist[5] + idv[4] * 5.0
-        r1f, r2f = dist[6], dist[7]
-
-        # States
-        uclr = np.r_[0, 0, 0, y[3:8]]
-        ucls = np.r_[0, 0, 0, y[12:17]]
-        ucvr, ucvs = y[0:3], y[9:12]
-        uclc, ucvv = y[18:26], y[27:35]
-        etr, ets, etc, etv = y[8], y[17], y[26], y[35]
-        twr, tws = y[36], y[37]
-        vpos = y[38:50]
-
-        xlr, xls = uclr / uclr.sum(), ucls / ucls.sum()
-        xlc, xvv = uclc / uclc.sum(), ucvv / ucvv.sum()
-
-        # Temperatures from energy holdups
-        tcr = temperature(xlr, etr / uclr.sum(), 0, self.t_guess[0])
-        tcs = temperature(xls, ets / ucls.sum(), 0, self.t_guess[1])
-        tcc = temperature(xlc, etc / uclc.sum(), 0, self.t_guess[2])
-        tcv = temperature(xvv, etv / ucvv.sum(), 2, self.t_guess[3])
-        self.t_guess[:] = tcr, tcs, tcc, tcv
-        tkr, tks, tkv = tcr + 273.15, tcs + 273.15, tcv + 273.15
-
-        # Volumes and pressures
-        dls, dlc = density(xls, tcs), density(xlc, tcc)
-        vlr = uclr.sum() / density(xlr, tcr)
-        vls = ucls.sum() / dls
-        vlc = uclc.sum() / dlc
-        vvr, vvs = VTR - vlr, VTS - vls
-
-        ppr, pps = np.zeros(8), np.zeros(8)
-        ppr[:3] = ucvr * RG * tkr / vvr
-        pps[:3] = ucvs * RG * tks / vvs
-        ppr[3:] = np.exp(AVP[3:] + BVP[3:] / (tcr + CVP[3:])) * xlr[3:]
-        pps[3:] = np.exp(AVP[3:] + BVP[3:] / (tcs + CVP[3:])) * xls[3:]
-        ptr, pts = ppr.sum(), pps.sum()
-        ptv = ucvv.sum() * RG * tkv / VTV
-        xvr, xvs = ppr / ptr, pps / pts
-
-        # Reaction rates
-        rr = np.zeros(4)
-        rr[0] = np.exp(31.5859536 - 40000.0 / 1.987 / tkr) * r1f
-        rr[1] = np.exp(3.00094014 - 20000.0 / 1.987 / tkr) * r2f
-        rr[2] = np.exp(53.4060443 - 60000.0 / 1.987 / tkr)
-        rr[3] = rr[2] * 0.767488334
-        if ppr[0] > 0 and ppr[2] > 0:
-            f = ppr[0] ** 1.1544 * ppr[2] ** 0.3735
-            rr[0] *= f * ppr[3]
-            rr[1] *= f * ppr[4]
-        else:
-            rr[0] = rr[1] = 0.0
-        rr[2] *= ppr[0] * ppr[4]
-        rr[3] *= ppr[0] * ppr[3]
-        rr *= vvr
-        crxr = np.array([-rr[0] - rr[1] - rr[2], 0.0, -rr[0] - rr[1], -rr[0] - 1.5 * rr[3],
-                         -rr[1] - rr[2], rr[2] + rr[3], rr[0], rr[1]])
-        rh = rr[0] * HTR[0] + rr[1] * HTR[1]
-
-        # Stream compositions x[s] and temperatures T[s], streams 1..13
-        x = {1: np.array(X_FEED[1]), 2: np.array(X_FEED[2]), 3: np.array(X_FEED[3]), 4: x4,
-             6: xvv, 8: xvr, 9: xvs, 10: xvs, 11: xls, 13: xlc}
-        T = {**t_feed, 6: tcv, 8: tcr, 9: tcs, 10: tcs, 11: tcs, 13: tcc}
-        mw = {s: np.sum(x[s] * XMW) for s in (1, 2, 6, 8, 9, 10)}
-        H = {s: enthalpy(x[s], T[s], 1) for s in (1, 2, 3, 4, 6, 8, 9)}
-        H[10] = H[9]
-        H[11] = enthalpy(x[11], T[11], 0)
-        H[13] = enthalpy(x[13], T[13], 0)
-
-        # Molar flows F[s]
-        F = {}
-        F[1] = vpos[0] * VRNG[0] / 100
-        F[2] = vpos[1] * VRNG[1] / 100
-        F[3] = vpos[2] * (1 - idv[5]) * VRNG[2] / 100
-        F[4] = vpos[3] * (1 - idv[6] * 0.2) * VRNG[3] / 100 + 1e-10
-        F[11] = vpos[6] * VRNG[6] / 100
-        F[13] = vpos[7] * VRNG[7] / 100
-        uac = vpos[8] * VRNG[8] * (1 + dist[8]) / 100
-        fwr = vpos[9] * VRNG[9] / 100
-        fws = vpos[10] * VRNG[10] / 100
-        agsp = (vpos[11] + 150) / 100
-
-        F[6] = 1937.6 * np.sqrt(max(ptv - ptr, 0)) / mw[6]
-        F[8] = 4574.21 * np.sqrt(max(ptr - pts, 0)) * (1 - 0.25 * dist[11]) / mw[8]
-        F[10] = vpos[5] * 0.151169 * np.sqrt(max(pts - 760, 0)) / mw[10]
-        pr = np.clip(ptv / pts, 1.0, CPPRMX)
-        flms = CPFLMX + CPFLMX / 1.197 * (1 - pr**3)
-        cpdh = flms * (tcs + 273.15) * 1.8e-6 * 1.9872 * (ptv - pts) / (mw[9] * pts)
-        flms = max(flms - vpos[4] * 53.349 * np.sqrt(max(ptv - pts, 0)), 1e-3)
-        F[9] = flms / mw[9]
-        H[9] += cpdh / F[9]
-
-        # Stripper: split of streams 4 + 11 into overhead (5) and bottoms (12)
-        if F[11] > 0.1:
-            if tcc > 170:
-                tmpfac = tcc - 120.262
-            elif tcc < 5.292:
-                tmpfac = 0.1
-            else:
-                tmpfac = 363.744 / (177 - tcc) - 2.22579488
-            v = F[4] / F[11] * tmpfac
-            k = np.array([8.5010, 11.402, 11.795, 0.0480, 0.0242])
-            sfr = np.r_[0.995, 0.991, 0.990, k * v / (1 + k * v)]
-        else:
-            sfr = np.array([0.995, 0.991, 0.990, 0.9999, 0.999, 0.999, 0.99, 0.98])
-        fcm = {s: x[s] * F[s] for s in (1, 2, 3, 4, 6, 8, 9, 10, 11, 13)}
-        fin = fcm[4] + fcm[11]
-        fcm[5] = sfr * fin
-        fcm[12] = fin - fcm[5]
-        F[5], F[12] = fcm[5].sum(), fcm[12].sum()
-        x[5], x[12] = fcm[5] / F[5], fcm[12] / F[12]
-        H[5] = enthalpy(x[5], tcc, 1)
-        H[12] = enthalpy(x[12], tcc, 0)
-        F[7], H[7], x[7], fcm[7] = F[6], H[6], x[6], fcm[6]
-
-        # Heat transfer
-        lev = vlr / 7.8
-        uarlev = 1.0 if lev > 50 else (0.0 if lev < 10 else 0.025 * lev - 0.25)
-        uar = uarlev * (-0.5 * agsp**2 + 2.75 * agsp - 2.5) * 855490e-6
-        qur = uar * (twr - tcr) * (1 - 0.35 * dist[9])
-        uas = 0.404655 * (1 - 1 / (1 + (F[8] / 3528.73) ** 4))
-        qus = uas * (tws - tcr) * (1 - 0.25 * dist[10])
-        quc = uac * (100 - tcc) if tcc < 100 else 0.0
-
-        # Derivatives
-        yp = np.zeros(50)
-        yp[0:8] = fcm[7] - fcm[8] + crxr
-        yp[9:17] = fcm[8] - fcm[9] - fcm[10] - fcm[11]
-        yp[18:26] = fcm[12] - fcm[13]
-        yp[27:35] = fcm[1] + fcm[2] + fcm[3] + fcm[5] + fcm[9] - fcm[6]
-        yp[8] = H[7] * F[7] - H[8] * F[8] + rh + qur
-        yp[17] = H[8] * F[8] - H[9] * F[9] - H[10] * F[10] - H[11] * F[11] + qus
-        yp[26] = H[4] * F[4] + H[11] * F[11] - H[5] * F[5] - H[13] * F[13] + quc
-        yp[35] = (H[1] * F[1] + H[2] * F[2] + H[3] * F[3] + H[5] * F[5]
-                  + H[9] * F[9] - H[6] * F[6])
-        yp[36] = (fwr * 500.53 * (tcwr - twr) - qur * 1e6 / 1.8) / HWR
-        yp[37] = (fws * 500.53 * (tcws - tws) - qus * 1e6 / 1.8) / HWS
-        yp[38:50] = (self.vcv - vpos) / VTAU
-
-        # Noise-free measurements XMEAS(1..22) and analyser compositions
-        meas = np.array([
-            F[3] * 0.359 / 35.3145, F[1] * mw[1] * 0.454, F[2] * mw[2] * 0.454,
-            F[4] * 0.359 / 35.3145, F[9] * 0.359 / 35.3145, F[6] * 0.359 / 35.3145,
-            (ptr - 760) / 760 * 101.325, (vlr - 84.6) / 666.7 * 100, tcr,
-            F[10] * 0.359 / 35.3145, tcs, (vls - 27.5) / 290 * 100,
-            (pts - 760) / 760 * 101.325, F[11] / dls / 35.3145,
-            (vlc - 78.25) / VTC * 100, (ptv - 760) / 760 * 101.325,
-            F[13] / dlc / 35.3145, tcc, quc * 1.04e3 * 0.454, cpdh * 0.29307e3, twr, tws])
-        comp = np.r_[x[7][:6], x[10], x[13][3:]] * 100   # XMEAS(23..41) before delay
-
-        shutdown = (meas[6] > 3000 or not 2 < vlr / 35.3145 < 24 or tcr > 175
-                    or not 1 < vls / 35.3145 < 12 or not 1 < vlc / 35.3145 < 8)
-        return yp, meas, comp, shutdown
-
-    def rhs(self, t, y):
-        return self.model(t, y)[0]
+    def close(self, shutdown, cfg):
+        self.flush()
+        for key, cols in NAMES.items():
+            self.f[key].attrs["names"] = cols
+        self.f.attrs["shutdown"] = shutdown
+        self.f.attrs["config"] = json.dumps(cfg)
+        self.f.close()
 
 
-# Closed-loop simulation
+# Simulation
 
-def simulate(config=None):
-    
+def simulate(config, writer):
+
     cfg = {**CONFIG, **(config or {})}
     hours, record_every, print_every = cfg["hours"], cfg["record_every"], cfg["print_every"]
     schedule = cfg["fault_schedule"]
@@ -461,16 +154,15 @@ def simulate(config=None):
     comp_delayed = comp.copy()
     t_gas, t_prod = 0.1, 0.25
 
-    T, XMEAS, XMV, SP = [], [], [], []
-    DIST, IDV, Y = [], [], []
     shutdown = False
+    t_wall = time.time()
 
     for step in range(n_steps + 1):
         t_s = step * dt
         t_h = t_s / 3600.0
 
         if print_every and t_s % print_every == 0:
-            print(f"Simulated {t_h:.1f} h of {hours:.1f} h", flush=True)
+            print(f"Simulated {t_h:.1f} h of {hours:.1f} h ({(time.time() - t_wall) / 60:.1f} min)", flush=True)
 
         # Faults
         plant.idv[:] = 0
@@ -482,7 +174,7 @@ def simulate(config=None):
         plant.update_walks(t_h)
         _, meas, comp, shutdown = plant.model(t_h, y)
         if shutdown:
-            print(f"Plant shutdown limit reached at t = {t_h:.2f} h")
+            print(f"Plant shutdown limit reached at t = {t_h:.2f} h", flush=True)
             break
         xmeas[:22] = meas + plant.rng.normal(0, noise[:22])
         if t_h >= t_gas:   # reactor feed and purge analysers, 0.1 h
@@ -539,13 +231,11 @@ def simulate(config=None):
 
         # Record
         if step > 0 and t_s % record_every == 0:
-            T.append(t_s)
-            XMEAS.append(xmeas.copy())
-            XMV.append(xmv.copy())
-            SP.append(sp[1:].copy())
-            DIST.append(plant.walk(t_h))
-            IDV.append(plant.idv.copy())
-            Y.append(y.copy())
+            dist = plant.walk(t_h)
+            writer.append(t=t_s, xmeas=xmeas.copy(), xmv=xmv.copy(), sp=sp[1:].copy(), dist=dist,
+                          idv=plant.idv.copy(), idv_effective=effective_idv(plant.idv, dist), y=y.copy())
+        if step > 0 and t_s % FLUSH_EVERY == 0:
+            writer.flush()
         if step == n_steps:
             break
 
@@ -555,105 +245,49 @@ def simulate(config=None):
                         rtol=1e-6, atol=1e-8)
         y = sol.y[:, -1]
 
-    return {"t": np.array(T), "xmeas": np.array(XMEAS), "xmv": np.array(XMV),
-            "sp": np.array(SP), "dist": np.array(DIST), "idv": np.array(IDV),
-            "y": np.array(Y), "shutdown": shutdown}
+    return shutdown
 
 
-# Plotting
+# Split the raw run into train / test files
 
-XMEAS_NAMES = [
-    "A feed (kscmh)", "D feed (kg/h)", "E feed (kg/h)", "A and C feed (kscmh)",
-    "Recycle flow (kscmh)", "Reactor feed rate (kscmh)", "Reactor pressure (kPa)",
-    "Reactor level (%)", "Reactor temperature (C)", "Purge rate (kscmh)",
-    "Separator temperature (C)", "Separator level (%)", "Separator pressure (kPa)",
-    "Separator underflow (m3/h)", "Stripper level (%)", "Stripper pressure (kPa)",
-    "Stripper underflow (m3/h)", "Stripper temperature (C)", "Stripper steam flow (kg/h)",
-    "Compressor work (kW)", "Reactor CW outlet temp (C)", "Separator CW outlet temp (C)",
-    *[f"Reactor feed {c} (mol%)" for c in "ABCDEF"],
-    *[f"Purge {c} (mol%)" for c in "ABCDEFGH"],
-    *[f"Product {c} (mol%)" for c in "DEFGH"]]
-
-XMV_NAMES = [
-    "D feed flow", "E feed flow", "A feed flow", "A and C feed flow",
-    "Compressor recycle valve", "Purge valve", "Separator underflow",
-    "Stripper product flow", "Stripper steam valve", "Reactor CW flow",
-    "Condenser CW flow", "Agitator speed"]
-
-SP_NAMES = [
-    "D feed flow (kg/h)", "E feed flow (kg/h)", "A feed flow (kscmh)", "A and C feed flow (kscmh)",
-    "Recycle flow (kscmh)", "Purge rate (kscmh)", "Separator level (%)", "Stripper level (%)",
-    "Stripper steam flow (kg/h)", "Reactor CW outlet temp (C)", "Stripper underflow (m3/h)",
-    "Separator pressure (kPa)", "Reactor feed A (mol%)", "Reactor feed D (mol%)",
-    "Reactor feed E (mol%)", "Stripper temperature (C)", "Reactor level (%)",
-    "Reactor temperature (C)", "Purge B (mol%)", "Product E (mol%)"]
-
-DIST_NAMES = [
-    "Feed 4 A fraction", "Feed 4 B fraction", "D feed temp (C)", "C feed temp (C)",
-    "Reactor CW inlet temp (C)", "Condenser CW inlet temp (C)", "Reaction 1 factor",
-    "Reaction 2 factor", "Stripper steam UA factor", "Reactor HT pulse",
-    "Condenser HT pulse", "Reactor-separator flow pulse"]
-
-STATE_NAMES = (
-    [f"Reactor vapour {c}" for c in "ABC"] + [f"Reactor liquid {c}" for c in "DEFGH"]
-    + ["Reactor energy"]
-    + [f"Separator vapour {c}" for c in "ABC"] + [f"Separator liquid {c}" for c in "DEFGH"]
-    + ["Separator energy"]
-    + [f"Stripper {c}" for c in "ABCDEFGH"] + ["Stripper energy"]
-    + [f"Header {c}" for c in "ABCDEFGH"] + ["Header energy"]
-    + ["Reactor CW outlet temp", "Condenser CW outlet temp"]
-    + [f"Valve {i} position" for i in range(1, 13)])
+def write_split(raw, path, mask, cfg, schedule, t_range):
+    with h5py.File(path, "w") as f:
+        f.create_dataset("t", data=raw["t"][mask])
+        for key, cols in NAMES.items():
+            ds = f.create_dataset(key, data=raw[key][mask], compression="gzip")
+            ds.attrs["names"] = cols
+        idv = raw["idv_effective"][mask]
+        fault = np.where(idv.any(axis=1), idv.argmax(axis=1) + 1, 0)
+        f.create_dataset("fault", data=fault)
+        f.attrs["shutdown"] = bool(raw["shutdown"])
+        f.attrs["config"] = json.dumps(cfg)
+        f.attrs["fault_schedule"] = json.dumps([s for s in schedule if t_range[0] <= s[1] < t_range[1]])
+        f.attrs["faults_used"] = FAULTS_USED
+        f.attrs["faults_excluded"] = FAULTS_EXCLUDED
+        f.attrs["sample_min"] = RECORD_EVERY / 60
+        f.attrs["t_range_h"] = list(t_range)
 
 
-def plot_results(out):
-    import matplotlib.pyplot as plt
-
-    t = out["t"] / 3600.0
-    fault_on = out["idv"].any(axis=1)
-
-    def grid(data, names, title, ncols):
-        n = data.shape[1]
-        nrows = int(np.ceil(n / ncols))
-        fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 2.2 * nrows), sharex=True)
-        for i, ax in enumerate(axes.ravel()):
-            if i >= n:
-                ax.axis("off")
-                continue
-            ax.fill_between(t, 0, 1, where=fault_on, color="tab:red", alpha=0.1,
-                            transform=ax.get_xaxis_transform(), step="post", lw=0)
-            ax.plot(t, data[:, i], lw=0.8)
-            ax.set_title(f"{i + 1}. {names[i]}", fontsize=8)
-            ax.tick_params(labelsize=7)
-            ax.grid(alpha=0.3)
-        for ax in axes[-1]:
-            ax.set_xlabel("Time (h)", fontsize=8)
-        fig.suptitle(title)
-        fig.tight_layout()
-
-    grid(out["xmeas"], XMEAS_NAMES, "Measurements XMEAS", 6)
-    grid(out["xmv"], XMV_NAMES, "Manipulated variables XMV (%)", 4)
-    grid(out["sp"], SP_NAMES, "Set points", 5)
-    grid(out["dist"], DIST_NAMES, "Disturbance signals", 4)
-    grid(out["y"], STATE_NAMES, "Process states", 6)
-
-    fig, ax = plt.subplots(figsize=(12, 4))
-    for f in range(1, 21):
-        ax.fill_between(t, f - 0.4, f + 0.4, where=out["idv"][:, f - 1] == 1, step="post",
-                        color="tab:blue" if f <= 7 else "tab:green" if f <= 14
-                        else "tab:orange" if f <= 17 else "tab:purple")
-    ax.set_yticks(range(1, 21))
-    ax.set_ylim(0.3, 20.7)
-    ax.invert_yaxis()
-    ax.set_ylabel("IDV")
-    ax.set_xlabel("Time (h)")
-    ax.set_title("Fault schedule (blue: steps, green: walks, orange: pulses, purple: stiction)")
-    ax.grid(alpha=0.3, axis="x")
-    fig.tight_layout()
-
-    plt.show()
+def split(cfg, schedule):
+    with h5py.File(RAW_PATH, "r") as f:
+        raw = {k: f[k][()] for k in ["t", *NAMES]}
+        raw["shutdown"] = f.attrs["shutdown"]
+    t_h = raw["t"] / 3600.0
+    write_split(raw, TRAIN_PATH, t_h <= T_SPLIT, cfg, schedule, (0.0, T_SPLIT))
+    write_split(raw, TEST_PATH, t_h > T_SPLIT, cfg, schedule, (T_SPLIT, HOURS))
+    print(f"train: {(t_h <= T_SPLIT).sum()} samples -> {TRAIN_PATH.name}")
+    print(f"test : {(t_h > T_SPLIT).sum()} samples -> {TEST_PATH.name}")
 
 
 if __name__ == "__main__":
-    out = simulate(CONFIG)
-    print(out["xmeas"].shape, out["xmv"].shape)
-    plot_results(out)
+    schedule = build_schedule()
+    cfg = {**CONFIG, "hours": HOURS, "seed": SEED, "record_every": RECORD_EVERY,
+           "print_every": 3600 * 5, "noise": NOISE, "fault_schedule": schedule}
+    for f, t_on, t_off in schedule:
+        print(f"IDV {f:2d}: {t_on:6.1f} - {t_off:6.1f} h")
+    writer = ChunkWriter(RAW_PATH)
+    shutdown = simulate(cfg, writer)
+    writer.close(shutdown, cfg)
+    if shutdown:
+        raise SystemExit("Shutdown during the run - partial data kept in " + RAW_PATH.name)
+    split(cfg, schedule)
