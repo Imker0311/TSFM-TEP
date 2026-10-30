@@ -12,8 +12,11 @@ conda-env/
 .env.*
 
 # HDF5 data files
-*.h5
-*.hdf5
+#*.h5
+#*.hdf5
+
+# Forecast results
+Results/
 
 # Python cache
 __pycache__/
