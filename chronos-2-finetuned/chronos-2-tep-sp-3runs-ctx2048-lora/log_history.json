@@ -1,0 +1,229 @@
+{
+ "log_history": [
+  {
+   "step": 50,
+   "loss": 6.465
+  },
+  {
+   "step": 50,
+   "eval_loss": 6.051
+  },
+  {
+   "step": 100,
+   "loss": 6.362
+  },
+  {
+   "step": 100,
+   "eval_loss": 5.927
+  },
+  {
+   "step": 150,
+   "loss": 6.417
+  },
+  {
+   "step": 150,
+   "eval_loss": 5.866
+  },
+  {
+   "step": 200,
+   "loss": 6.293
+  },
+  {
+   "step": 200,
+   "eval_loss": 5.819
+  },
+  {
+   "step": 250,
+   "loss": 6.2
+  },
+  {
+   "step": 250,
+   "eval_loss": 5.79
+  },
+  {
+   "step": 300,
+   "loss": 6.16
+  },
+  {
+   "step": 300,
+   "eval_loss": 5.768
+  },
+  {
+   "step": 350,
+   "loss": 6.111
+  },
+  {
+   "step": 350,
+   "eval_loss": 5.756
+  },
+  {
+   "step": 400,
+   "loss": 5.988
+  },
+  {
+   "step": 400,
+   "eval_loss": 5.746
+  },
+  {
+   "step": 450,
+   "loss": 6.033
+  },
+  {
+   "step": 450,
+   "eval_loss": 5.741
+  },
+  {
+   "step": 500,
+   "loss": 5.976
+  },
+  {
+   "step": 500,
+   "eval_loss": 5.722
+  },
+  {
+   "step": 550,
+   "loss": 5.821
+  },
+  {
+   "step": 550,
+   "eval_loss": 5.724
+  },
+  {
+   "step": 600,
+   "loss": 6.169
+  },
+  {
+   "step": 600,
+   "eval_loss": 5.711
+  },
+  {
+   "step": 650,
+   "loss": 6.048
+  },
+  {
+   "step": 650,
+   "eval_loss": 5.726
+  },
+  {
+   "step": 700,
+   "loss": 5.918
+  },
+  {
+   "step": 700,
+   "eval_loss": 5.71
+  },
+  {
+   "step": 750,
+   "loss": 5.958
+  },
+  {
+   "step": 750,
+   "eval_loss": 5.712
+  },
+  {
+   "step": 800,
+   "loss": 6.099
+  },
+  {
+   "step": 800,
+   "eval_loss": 5.705
+  },
+  {
+   "step": 850,
+   "loss": 5.853
+  },
+  {
+   "step": 850,
+   "eval_loss": 5.713
+  },
+  {
+   "step": 900,
+   "loss": 5.858
+  },
+  {
+   "step": 900,
+   "eval_loss": 5.688
+  },
+  {
+   "step": 950,
+   "loss": 5.884
+  },
+  {
+   "step": 950,
+   "eval_loss": 5.698
+  },
+  {
+   "step": 1000,
+   "loss": 5.937
+  },
+  {
+   "step": 1000,
+   "eval_loss": 5.681
+  },
+  {
+   "step": 1050,
+   "loss": 5.877
+  },
+  {
+   "step": 1050,
+   "eval_loss": 5.697
+  },
+  {
+   "step": 1100,
+   "loss": 5.898
+  },
+  {
+   "step": 1100,
+   "eval_loss": 5.69
+  },
+  {
+   "step": 1150,
+   "loss": 5.755
+  },
+  {
+   "step": 1150,
+   "eval_loss": 5.683
+  },
+  {
+   "step": 1200,
+   "loss": 5.883
+  },
+  {
+   "step": 1200,
+   "eval_loss": 5.692
+  },
+  {
+   "step": 1250,
+   "loss": 5.856
+  },
+  {
+   "step": 1250,
+   "eval_loss": 5.691
+  },
+  {
+   "step": 1300,
+   "loss": 5.805
+  },
+  {
+   "step": 1300,
+   "eval_loss": 5.701
+  },
+  {
+   "step": 1350,
+   "loss": 5.708
+  },
+  {
+   "step": 1350,
+   "eval_loss": 5.692
+  },
+  {
+   "step": 1400,
+   "loss": 5.739
+  },
+  {
+   "step": 1400,
+   "eval_loss": 5.684
+  }
+ ],
+ "note": "recovered from the printed training log of TEP-Chronos2-FineTune.ipynb (the Trainer kept only the best checkpoint)"
+}
